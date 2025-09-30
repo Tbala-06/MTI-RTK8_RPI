@@ -37,7 +37,7 @@ PSEL 0 = 1
 PSEL 0 = 0
 ```
 
-![As such](images/image1.jpg)
+![As such](images/Image1.jpg)
 
 As such
 
