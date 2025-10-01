@@ -60,7 +60,7 @@ Install `pyserial` if not already installed:
 pip install pyserial
 ```
 
-Copy `mti_parser.py` into your project folder.
+Copy `MTI_rtk8_lib.py` into your project folder.
 
 ## Usage for Code
 
