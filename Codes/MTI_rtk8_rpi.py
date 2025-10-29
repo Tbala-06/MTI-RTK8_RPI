@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTi IMU Parser - Thonny Compatible Version
-===========================================
+MTi IMU Parser - Thonny Compatible Version with RTK Support
+============================================================
 Simple, clean parser for MTi sensor data
 Works on Raspberry Pi with Thonny IDE
+Supports NTRIP RTK corrections for precise positioning
 """
 
 import time
 import struct
 import serial
+import socket
+import base64
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict
 
@@ -43,8 +47,106 @@ class IMUData:
         return {"fix": fix_types.get(gps_fix, "Unknown ({})".format(gps_fix)), "satellites": num_sats}
 
 
+class NTRIPClient:
+    """NTRIP client for RTK corrections"""
+    
+    def __init__(self, host, port, mountpoint, username, password):
+        self.host = host
+        self.port = port
+        self.mountpoint = mountpoint
+        self.username = username
+        self.password = password
+        self.socket = None
+        self.running = False
+        self.thread = None
+        self.correction_callback = None
+        self.stats = {
+            "bytes_received": 0,
+            "corrections_sent": 0,
+            "connection_errors": 0
+        }
+    
+    def connect(self) -> bool:
+        """Connect to NTRIP caster"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(10)
+            self.socket.connect((self.host, self.port))
+            
+            # Send NTRIP request
+            auth_string = "{}:{}".format(self.username, self.password)
+            auth_encoded = base64.b64encode(auth_string.encode()).decode()
+            
+            request = (
+                "GET /{} HTTP/1.0\r\n"
+                "User-Agent: NTRIP PythonClient/1.0\r\n"
+                "Authorization: Basic {}\r\n"
+                "\r\n"
+            ).format(self.mountpoint, auth_encoded)
+            
+            self.socket.sendall(request.encode())
+            
+            # Wait for response
+            response = self.socket.recv(1024).decode()
+            
+            if "200 OK" in response or "ICY 200 OK" in response:
+                print("RTK: Connected to {}:{}/{}".format(self.host, self.port, self.mountpoint))
+                return True
+            else:
+                print("RTK: Connection failed: {}".format(response))
+                self.socket.close()
+                return False
+                
+        except Exception as e:
+            print("RTK: Connection error: {}".format(e))
+            self.stats["connection_errors"] += 1
+            return False
+    
+    def start_corrections(self, callback):
+        """Start receiving corrections in background thread"""
+        self.correction_callback = callback
+        self.running = True
+        self.thread = threading.Thread(target=self._correction_loop, daemon=True)
+        self.thread.start()
+        print("RTK: Correction thread started")
+    
+    def _correction_loop(self):
+        """Background thread to receive and forward corrections"""
+        while self.running:
+            try:
+                data = self.socket.recv(4096)
+                if data:
+                    self.stats["bytes_received"] += len(data)
+                    if self.correction_callback:
+                        self.correction_callback(data)
+                        self.stats["corrections_sent"] += 1
+                else:
+                    print("RTK: Connection closed by server")
+                    break
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print("RTK: Error: {}".format(e))
+                self.stats["connection_errors"] += 1
+                break
+        
+        self.running = False
+    
+    def stop(self):
+        """Stop corrections and disconnect"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+        if self.socket:
+            self.socket.close()
+        print("RTK: Client stopped")
+    
+    def is_connected(self) -> bool:
+        return self.running and self.socket is not None
+
+
 class MTiParser:
-    """Parser for MTi continuous data stream"""
+    """Parser for MTi continuous data stream with RTK support"""
     
     # Preamble and message IDs
     PREAMBLE = 0xFA
@@ -75,11 +177,13 @@ class MTiParser:
         self.baudrate = baudrate
         self.serial = None
         self.buffer = bytearray()
+        self.ntrip = None
         self.stats = {
             "packets_found": 0,
             "packets_parsed": 0,
             "errors": 0,
-            "bytes_processed": 0
+            "bytes_processed": 0,
+            "rtk_corrections": 0
         }
     
     def connect(self) -> bool:
@@ -105,9 +209,66 @@ class MTiParser:
             return False
     
     def disconnect(self):
+        if self.ntrip:
+            self.ntrip.stop()
         if self.serial and self.serial.is_open:
             self.serial.close()
             print("Disconnected")
+    
+    def enable_rtk(self, host, port, mountpoint, username, password) -> bool:
+        """
+        Enable RTK corrections via NTRIP
+        
+        Args:
+            host: NTRIP caster hostname (e.g., 'rtk2go.com')
+            port: NTRIP caster port (usually 2101)
+            mountpoint: Mountpoint name (e.g., 'MyBase')
+            username: NTRIP username
+            password: NTRIP password
+        
+        Returns:
+            True if RTK enabled successfully
+        """
+        if not self.serial or not self.serial.is_open:
+            print("RTK: MTi must be connected first")
+            return False
+        
+        self.ntrip = NTRIPClient(host, port, mountpoint, username, password)
+        
+        if not self.ntrip.connect():
+            self.ntrip = None
+            return False
+        
+        # Start forwarding corrections to MTi
+        self.ntrip.start_corrections(self._send_rtk_correction)
+        return True
+    
+    def _send_rtk_correction(self, data: bytes):
+        """Send RTK correction data to MTi device"""
+        try:
+            if self.serial and self.serial.is_open:
+                self.serial.write(data)
+                self.stats["rtk_corrections"] += 1
+        except Exception as e:
+            print("RTK: Failed to send correction: {}".format(e))
+    
+    def get_rtk_status(self) -> Dict:
+        """Get RTK connection status and statistics"""
+        if not self.ntrip:
+            return {
+                "enabled": False,
+                "connected": False,
+                "bytes_received": 0,
+                "corrections_sent": 0
+            }
+        
+        return {
+            "enabled": True,
+            "connected": self.ntrip.is_connected(),
+            "bytes_received": self.ntrip.stats["bytes_received"],
+            "corrections_sent": self.ntrip.stats["corrections_sent"],
+            "connection_errors": self.ntrip.stats["connection_errors"]
+        }
     
     def find_message(self) -> Optional[bytes]:
         """Find and extract a complete message from buffer"""
@@ -301,6 +462,42 @@ class MTiParser:
         
         return None
     
+    def read_latlon(self, timeout=3.0) -> Optional[Tuple[float, float]]:
+        """
+        Read GPS latitude/longitude
+        YOUR EXISTING CODE WORKS WITH THIS - NO CHANGES NEEDED!
+        """
+        if not self.serial or not self.serial.is_open:
+            return None
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Read available data
+            if self.serial.in_waiting > 0:
+                new_data = self.serial.read(self.serial.in_waiting)
+                self.buffer.extend(new_data)
+                self.stats["bytes_processed"] += len(new_data)
+            
+            # Try to find and parse a message
+            message = self.find_message()
+            if message:
+                parsed = self.parse_message(message)
+                if parsed and parsed.latitude_longitude:
+                    return parsed.latitude_longitude
+            
+            time.sleep(0.01)
+        
+        return None
+    
+    def read_euler(self, timeout=3.0) -> Optional[Tuple[float, float, float]]:
+        """
+        Read Euler angles
+        YOUR EXISTING CODE WORKS WITH THIS - NO CHANGES NEEDED!
+        """
+        data = self.read_data(timeout)
+        return data.euler_angles if data else None
+    
     def print_data(self, data: IMUData):
         """Print IMU data"""
         print("\n" + "="*70)
@@ -334,7 +531,9 @@ class MTiParser:
         
         if data.latitude_longitude:
             lat, lon = data.latitude_longitude
-            print("GPS:    Lat={:11.7f} deg  Lon={:11.7f} deg".format(lat, lon))
+            gps_info = data.get_gps_info()
+            print("GPS:    Lat={:11.7f} deg  Lon={:11.7f} deg  [{}]".format(
+                lat, lon, gps_info['fix']))
         
         if data.baro_pressure:
             print("Baro:   {} Pa".format(data.baro_pressure))
@@ -364,10 +563,12 @@ class MTiParser:
                 else:
                     elapsed = time.time() - start_time
                     if elapsed - last_print > 1.0:
-                        print("\rWaiting... {}s  Buffer: {} bytes  Found: {}  Parsed: {}  Errors: {}".format(
+                        rtk_status = " RTK: {} bytes".format(
+                            self.get_rtk_status()['bytes_received']) if self.ntrip else ""
+                        print("\rWaiting... {}s  Buffer: {} bytes  Found: {}  Parsed: {}  Errors: {}{}".format(
                             int(elapsed), len(self.buffer), 
                             self.stats['packets_found'], self.stats['packets_parsed'], 
-                            self.stats['errors']), end="", flush=True)
+                            self.stats['errors'], rtk_status), end="", flush=True)
                         last_print = elapsed
                 
                 time.sleep(0.02)
@@ -385,14 +586,22 @@ class MTiParser:
         if self.stats['packets_found'] > 0:
             rate = (self.stats['packets_parsed'] / self.stats['packets_found']) * 100
             print("  Parse success rate: {:.1f}%".format(rate))
+        
+        rtk_status = self.get_rtk_status()
+        if rtk_status['enabled']:
+            print("\nRTK Statistics:")
+            print("  Connected: {}".format(rtk_status['connected']))
+            print("  Corrections received: {} bytes".format(rtk_status['bytes_received']))
+            print("  Corrections sent to MTi: {}".format(rtk_status['corrections_sent']))
+        
         print("="*70)
         
         return sample_count
 
 
 def main():
-    """Main function"""
-    print("MTi IMU Parser - Thonny Compatible")
+    """Main function with RTK example"""
+    print("MTi IMU Parser - Thonny Compatible with RTK")
     print("=" * 70)
     
     parser = MTiParser(port='/dev/serial0', baudrate=115200)
@@ -400,6 +609,21 @@ def main():
     if not parser.connect():
         print("Failed to connect")
         return
+    
+    # OPTIONAL: Enable RTK corrections
+    # Uncomment and configure with your NTRIP settings:
+    """
+    if parser.enable_rtk(
+        host='rtk2go.com',
+        port=2101,
+        mountpoint='YourMountpoint',
+        username='your_email',
+        password='none'
+    ):
+        print("RTK corrections enabled!")
+        print("Waiting for RTK fix...")
+        time.sleep(5)
+    """
     
     print("\nChecking for data...")
     time.sleep(0.5)
@@ -411,6 +635,16 @@ def main():
         print("No data received - device may need configuration")
         parser.disconnect()
         return
+    
+    # YOUR EXISTING CODE WORKS HERE - EXAMPLE:
+    print("\n--- Testing your existing code pattern ---")
+    latlon = parser.read_latlon(timeout=3.0)
+    if latlon:
+        lat, lon = latlon
+        print("Latitude: {:.6f}, Longitude: {:.6f}".format(lat, lon))
+    else:
+        print("No GPS data received")
+    print("---")
     
     try:
         parser.run_continuous(duration=60)
